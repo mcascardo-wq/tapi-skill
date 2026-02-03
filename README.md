@@ -1,21 +1,21 @@
-# @tapi/skills
+# @tapi.la/skills
 
 CLI para instalar skills de TAPI en proyectos, permitiendo que AI coding assistants (Cursor, Claude Code, Windsurf) entiendan cómo integrar con TAPI.
 
 ## Instalación
 
 ```bash
-npx @tapi/skills install --cursor
+npx @tapi.la/skills install --cursor
 ```
 
 ## Comandos
 
 ```bash
 # Listar skills disponibles
-npx @tapi/skills list
+npx @tapi.la/skills list
 
 # Instalar todos los skills
-npx @tapi/skills install --cursor
+npx @tapi.la/skills install --cursor
 npx @tapi/skills install --claude
 npx @tapi/skills install --windsurf
 npx @tapi/skills install --project
@@ -24,7 +24,7 @@ npx @tapi/skills install --project
 npx @tapi/skills install recargas --cursor
 
 # Actualizar skills instalados
-npx @tapi/skills update
+npx @tapi.la/skills update
 ```
 
 ## Skills Disponibles

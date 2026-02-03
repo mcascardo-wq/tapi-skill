@@ -1,5 +1,5 @@
 {
-  "name": "@tapi/skills",
+  "name": "@tapi.la/skills",
   "version": "1.0.0",
   "description": "Install TAPI integration skills for AI coding assistants",
   "type": "module",
