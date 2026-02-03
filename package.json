@@ -1,0 +1,40 @@
+{
+  "name": "@tapi/skills",
+  "version": "1.0.0",
+  "description": "Install TAPI integration skills for AI coding assistants",
+  "type": "module",
+  "bin": {
+    "tapi-skills": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "tapi",
+    "ai",
+    "cursor",
+    "claude",
+    "windsurf",
+    "skills",
+    "payments",
+    "latam"
+  ],
+  "author": "TAPI",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "commander": "^12.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
