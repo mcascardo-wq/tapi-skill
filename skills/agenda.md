@@ -2,11 +2,20 @@
 
 ## Que es
 
-El modulo de Agenda gestiona recordatorios de pagos a traves de dos conceptos fundamentales: adhesion y notificacion.
+El modulo de Agenda gestiona recordatorios de pagos y debito automatico a traves de tres conceptos fundamentales: adhesion, notificacion y debito automatico.
 
 La **adhesion** es el vinculo del usuario X con la empresa Y mediante un identificador. El usuario queda registrado a traves del identificador ingresado con la empresa elegida para pagar. TAPI interpreta que ese usuario quiere ser notificado cuando tenga una nueva deuda por pagar.
 
 La **notificacion** es el aviso de nueva deuda o recordatorio a pagar por parte de TAPI, dada una adhesion.
+
+El **debito automatico** permite automatizar el pago recurrente de servicios: cuando TAPI detecta una nueva deuda para una adhesion con debito activo, notifica a la fintech para que ejecute el cobro sin intervencion del usuario.
+
+## URLs Base
+
+| Ambiente | URL |
+|----------|-----|
+| Sandbox | `https://agenda.homo.tapila.cloud` |
+| Produccion | `https://agenda.tapila.cloud` |
 
 ## Conceptos Clave
 
@@ -165,10 +174,11 @@ Activa, desactiva o modifica el alias de una adhesion.
 
 **Errores:**
 
-| Codigo | Estado | Mensaje |
-|--------|--------|---------|
-| AGM0003 | 404 | There are no adhesions. |
-| AGM0004 | 504 | There was an unknown error requesting a adhesion. |
+| Codigo | Estado | Mensaje | Solucion |
+|--------|--------|---------|----------|
+| AGXCX0003 | 400 | isAdhered and alias is invalid | Body vacio o sin campos validos. Enviar al menos `isAdhered` o `alias` |
+| AGM0003 | 404 | There are no adhesions | El `agendaId` no existe. Verificar con `GET /adhesions` |
+| AGM0004 | 504 | There was an unknown error requesting a adhesion | Reintentar con backoff |
 
 ---
 
@@ -234,7 +244,7 @@ Crea una adhesion manualmente sin necesidad de pasar por el flujo de pago.
 
 ### Webhook de Adhesiones
 
-Webhook configurable que envia las adhesiones generadas por pagos del usuario. Puede incluir headers custom para autenticacion.
+Webhook configurable que envia las adhesiones generadas por pagos del usuario. Se configura informando la URL al equipo de integraciones (ver skill **Base**). El campo `hash` permite validar la autenticidad si se tiene configurado un metodo de seguridad.
 
 **Payload:**
 ```json
@@ -350,7 +360,7 @@ Para `PAY_AGAIN`:
 
 ### Webhook de Recordatorios
 
-Webhook configurable que envia las notificaciones de agenda al instante. Puede incluir headers custom para autenticacion.
+Webhook configurable que envia las notificaciones de agenda al instante. Se configura informando la URL al equipo de integraciones (ver skill **Base**). El campo `hash` permite validar la autenticidad si se tiene configurado un metodo de seguridad.
 
 Hay tres tipos de webhook:
 
@@ -428,13 +438,15 @@ Prepara el pago a partir de notificaciones de agenda, sin necesidad de consultar
 **Request:**
 ```json
 {
-  "ids": ["notificationId-1", "notificationId-2"]
+  "ids": ["notificationId-1", "notificationId-2"],
+  "externalClientId": "uuid-del-usuario"
 }
 ```
 
 | Campo | Tipo | Requerido | Descripcion |
 |-------|------|-----------|-------------|
-| ids | String[] | Si | Coleccion de identificadores de notificaciones de agenda (`id` del notification) |
+| ids | String[] | Si | Coleccion de identificadores de notificaciones de agenda (`id` del notification). Maximo 10 |
+| externalClientId | String | Si | Identificador unico del usuario final. **Debe ser el mismo** usado en todos los endpoints |
 
 **Response 200 OK:**
 ```json
@@ -482,16 +494,17 @@ Para status `FAILED`, el campo `error` contiene la respuesta de error del servic
 
 **Errores:**
 
-| Codigo | Estado | Mensaje |
-|--------|--------|---------|
-| SDE04342 | 404 | There is no pending debt. |
-| XCX05060 | 500 | There was an unknown error while executing the request. |
+| Codigo | Estado | Mensaje | Solucion |
+|--------|--------|---------|----------|
+| idsError | 400 | Error: ids isn't an array | El campo `ids` no es un array o falta en el body. Enviar `ids` como array de strings |
+| SDE04342 | 200 (in-response) | There is no pending debt | El notificationId es invalido o la deuda ya fue pagada. Verificar via `GET /notifications` |
+| XCX05060 | 500 | There was an unknown error while executing the request | Reintentar con backoff |
 
 ---
 
-### POST /bulk-payment
+### POST /payments/bulk
 
-Permite pagar multiples deudas en una sola solicitud (hasta 10). Funciona similar a `/payment` de billPayment pero acepta una coleccion. La confirmacion llega via webhook por separado para cada pago.
+Permite pagar multiples deudas en una sola solicitud. Funciona similar a `/payment` de billPayment pero acepta una coleccion. Cada deuda se procesa de forma **independiente** (no es transaccional). La confirmacion llega via webhook por separado para cada pago.
 
 **Headers:**
 - `x-authorization-token`
@@ -549,32 +562,366 @@ Si alguno de los pagos falla, se deben realizar reembolsos parciales al usuario.
 
 **Errores:**
 
-| Codigo | Estado | Mensaje |
-|--------|--------|---------|
-| XCX05060 | 500 | There was an unknown error while executing the request. |
+| Codigo | Estado | Mensaje | Solucion |
+|--------|--------|---------|----------|
+| AGP0001 | 400 | The array should have at least one debt | `debtsToPay` falta o es un array vacio. Enviar al menos un elemento |
+| SPA04649 | 200 (in-response) | The debt has already been processed | El `debtId` ya fue pagado. No reintentar |
+| SPA04345 | 200 (in-response) | Debt not found | El `debtId` expiro. Ejecutar `POST /prepare-payment` nuevamente |
+| XCX05060 | 500 | There was an unknown error while executing the request | Reintentar con backoff |
 
 ## Flujo de Pago desde Notificaciones
 
 Hay dos opciones para pagar a partir de notificaciones:
 
-1. **Flujo tradicional**: Usar el `notificationId` como debtId y avanzar con los endpoints de pago de servicios (`POST /payment` + webhook `confirmPayment`).
-2. **Flujo bulk**: Usar `POST /prepare-payment` con los notificationIds, luego `POST /bulk-payment` con los debtIds obtenidos. La confirmacion llega por webhook individual para cada pago.
+1. **Flujo tradicional**: Usar `POST /prepare-payment` con el notificationId, obtener el `debtId`, y avanzar con `POST /payment` + webhook `confirmPayment`.
+2. **Flujo bulk**: Usar `POST /prepare-payment` con los notificationIds, filtrar los SUCCESS, luego `POST /payments/bulk` con los debtIds obtenidos. La confirmacion llega por webhook individual para cada pago.
 
 ## Envio de Recordatorios
 
-Los recordatorios se pueden recibir por tres vias:
+Los recordatorios se pueden recibir por dos vias:
 
-1. **SFTP**: Archivo con novedades de TODOS los usuarios. Cada tipo de notificacion tiene su propio archivo.
-2. **Webhook**: Envio instantaneo para un usuario particular (requiere configuracion).
-3. **API**: Consulta bajo demanda via `GET /notifications/{externalClientId}`.
+1. **Webhook**: Envio instantaneo para un usuario particular (requiere configuracion con el equipo de integraciones).
+2. **API**: Consulta bajo demanda via `GET /notifications/{externalClientId}`.
+
+## Debito Automatico
+
+Permite automatizar pagos recurrentes sin intervencion del usuario en cada ciclo. Requiere una adhesion existente y activa.
+
+### Flujo
+
+```
+1. PATCH /automatic-debit (activar)
+2. TAPI detecta nueva deuda
+3. Webhook debit-incoming → Fintech
+4. Fintech debita al usuario
+5. POST /automatic-debit/confirm
+6. TAPI confirma y cierra ciclo
+```
+
+### PATCH /automatic-debit
+
+Activa o desactiva el debito automatico para una adhesion.
+
+**Headers:**
+- `x-authorization-token`
+- `x-api-key` (API key del microservicio Agenda)
+
+**Request:**
+```json
+{
+  "agendaId": "externalClientId#modalityId#identifierValue",
+  "subscribeToAutomaticDebit": true
+}
+```
+
+| Campo | Tipo | Requerido | Descripcion |
+|-------|------|-----------|-------------|
+| agendaId | String | Si | Identificador unico de la adhesion |
+| subscribeToAutomaticDebit | Boolean | Si | `true` para activar, `false` para desactivar |
+
+**Response 200 OK:**
+```json
+{
+  "agendaAdhesion": {
+    "serviceIdentifier": "1000000000",
+    "modalityId": "45d55ec4-aa8f-4cf9-9ff5-1d0d672a4318",
+    "companyCode": "MX-S-00384",
+    "alias": "",
+    "type": "NEW_BILL",
+    "agendaId": "test-agenda-001#45d55ec4-...#1000000000",
+    "isAutomaticDebit": true,
+    "isAdhered": true
+  },
+  "tx": "...",
+  "mainTx": "..."
+}
+```
+
+**Errores:**
+
+| Codigo | HTTP | Mensaje | Solucion |
+|--------|------|---------|----------|
+| AGA0003 | 404 | There are no adhesions for the user | El `agendaId` no existe. Verificar con `GET /adhesions` |
+
+---
+
+### Webhook debit-incoming
+
+Cuando TAPI detecta una nueva deuda para una adhesion con debito automatico activo, envia este webhook a la fintech.
+
+**Payload:**
+```json
+{
+  "type": "debit-incoming",
+  "agendaId": "user-001#modalityId#identifierValue",
+  "companyName": "CFE",
+  "companyCode": "MX-S-00XXX",
+  "amount": 500.00,
+  "currencyCode": "MXN",
+  "expirationDate": "2026-04-15",
+  "taskToken": "eyJhbGciOiJIUzI1NiIs...",
+  "hash": "abc123def456"
+}
+```
+
+| Campo | Tipo | Descripcion |
+|-------|------|-------------|
+| type | String | Siempre `"debit-incoming"` |
+| agendaId | String | Identificador de la adhesion |
+| companyName | String | Nombre de la empresa |
+| companyCode | String | Codigo de la empresa |
+| amount | Number | Monto a debitar |
+| currencyCode | String | Moneda ISO 4217 (ej: `MXN`) |
+| expirationDate | String | Fecha limite de pago (ISO date) |
+| taskToken | String | **CRITICO**: Token que debe reenviarse en `POST /automatic-debit/confirm` |
+| hash | String | Hash para validar autenticidad |
+
+**IMPORTANTE**: El `taskToken` debe almacenarse de forma segura. Sin el, no es posible confirmar el debito a TAPI.
+
+---
+
+### POST /automatic-debit/confirm
+
+Confirma a TAPI el resultado del debito automatico.
+
+**Headers:**
+- `x-authorization-token`
+- `x-api-key` (API key del microservicio Agenda)
+
+**Request:**
+```json
+{
+  "agendaId": "user-001#modalityId#identifierValue",
+  "taskToken": "eyJhbGciOiJIUzI1NiIs...",
+  "status": "SUCCESS",
+  "externalPaymentId": "uuid-v4-del-pago"
+}
+```
+
+| Campo | Tipo | Requerido | Descripcion |
+|-------|------|-----------|-------------|
+| agendaId | String | Si | Identificador de la adhesion |
+| taskToken | String | Si | Token recibido en el webhook `debit-incoming` |
+| status | String | Si | `"SUCCESS"` si el debito fue exitoso, `"FAILED"` si no se pudo debitar |
+| externalPaymentId | String (UUID v4) | Solo si SUCCESS | ID unico del pago generado por la fintech |
+
+**Response 200 OK:**
+```json
+{
+  "message": "Confirmation received",
+  "tx": "...",
+  "mainTx": "..."
+}
+```
+
+**Errores:**
+
+| HTTP | Mensaje | Causa | Solucion |
+|------|---------|-------|----------|
+| 400 | Bad Request | Campos faltantes o invalidos | Verificar todos los campos requeridos |
+| 404 | Not Found | `agendaId` o `taskToken` invalido | Verificar que el `taskToken` corresponda al webhook recibido |
+| 409 | Conflict | Confirmacion duplicada (taskToken ya usado) | No reenviar; ya fue procesada |
+
+---
+
+## Sandbox: Notificaciones y Reprocess
+
+En el ambiente de Sandbox, las notificaciones de agenda **NO se generan automaticamente**. Para forzar la generacion de notificaciones en sandbox, usar el microservicio **Tools**:
+
+```
+POST https://tools.homo.tapila.cloud/agenda/adhesions/reprocess
+```
+
+**Headers:**
+- `x-authorization-token`
+- `x-api-key` (API key del microservicio Tools)
+
+**Request:**
+```json
+{
+  "externalClientId": "uuid-del-usuario",
+  "forceNotification": true
+}
+```
+
+Esto forza a TAPI a consultar deudas de las adhesiones del usuario y generar notificaciones/webhooks. Solo disponible en sandbox; en produccion las notificaciones se generan automaticamente.
+
+## Flujos Detallados
+
+### Flujo de Adhesion (Alta)
+```
+1. Usuario paga un servicio con isSchedulable: true
+   ↓
+2. TAPI crea adhesion automaticamente (vinculo usuario-empresa-identificador)
+   ↓
+3. Webhook ADHESION_CREATED → Fintech recibe la nueva adhesion
+   ↓
+4. Mostrar en "Mis servicios" del usuario
+```
+
+**Alternativa: Adhesion manual (sin pago previo)**
+```
+1. Usuario quiere adherirse sin pagar → POST /adhesions/register
+   ↓
+2. TAPI crea adhesion manualmente
+   ↓
+3. Mostrar en "Mis servicios" del usuario
+```
+
+### Flujo de Notificaciones y Pago
+```
+1. TAPI detecta nueva deuda para una adhesion activa
+   ↓
+2a. Webhook AGENDA_NOTIFICATION → Fintech recibe la notificacion
+   ↓ (alternativa)
+2b. GET /notifications/{externalClientId} → Consultar notificaciones
+   ↓
+3. Mostrar notificacion al usuario (monto, empresa, vencimiento)
+   ↓
+4. Usuario decide pagar → POST /prepare-payment con notificationId(s)
+   ↓  Convierte notificationId a debtId
+   ↓
+5a. Pago individual → POST /payment (microservicio Services) con debtId
+5b. Pago multiple → POST /payments/bulk con debtIds
+   ↓
+6. Webhook confirmPayment o DELETE_NOTIFICATION confirma el pago
+   ↓
+7. Notificacion desaparece de la lista (source: "PAYMENT")
+```
+
+### Flujo de Debito Automatico
+```
+1. PATCH /automatic-debit → Activar debito automatico para una adhesion
+   ↓
+2. TAPI detecta nueva deuda
+   ↓
+3. Webhook debit-incoming → Fintech recibe monto + taskToken
+   ↓
+4. Fintech debita al usuario (logica propia)
+   ↓
+5a. Exito → POST /automatic-debit/confirm con status: "SUCCESS" + externalPaymentId
+5b. Fallo → POST /automatic-debit/confirm con status: "FAILED"
+   ↓
+6. TAPI confirma y cierra ciclo
+```
+
+### Flujo de Gestion de Adhesiones
+```
+Pantalla "Mis servicios":
+1. GET /adhesions/{externalClientId} → Listar adhesiones
+   ↓
+Activar/desactivar notificaciones:
+2. PATCH /adhesions con isAdhered: true/false
+   ↓
+Cambiar alias:
+3. PATCH /adhesions con alias: "Mi luz"
+   ↓
+Activar/desactivar debito automatico:
+4. PATCH /automatic-debit con subscribeToAutomaticDebit: true/false
+```
 
 ## Buenas Practicas
 
-- Usar el mismo `externalClientId` en todos los flujos (billPayment y agenda)
-- Guardar `agendaId` y `notificationId` para soporte y trazabilidad
+- Usar el mismo `externalClientId` en todos los flujos (billPayment, agenda, debito automatico)
+- Guardar `agendaId`, `notificationId` y `taskToken` (debito automatico) para soporte y trazabilidad
 - Validar que la adhesion este activa (`isAdhered: true`) antes de mostrarla al usuario
 - Implementar el webhook de recordatorios para notificaciones en tiempo real
-- Para pagos multiples via bulk-payment, implementar logica de reembolso parcial en caso de fallo
+- Para pagos multiples via `/payments/bulk`, implementar logica de reembolso parcial en caso de fallo
+- Para debito automatico, almacenar el `taskToken` de forma segura y confirmar siempre el resultado a TAPI
+- En sandbox, usar `POST /agenda/adhesions/reprocess` con `forceNotification: true` para generar notificaciones de prueba
+- Responder HTTP 200 a los webhooks inmediatamente, procesar logica de negocio asincronamente
+- Implementar idempotencia en handlers de webhook (TAPI puede reenviar si no recibe 200)
+
+## Preguntas Frecuentes (FAQs)
+
+### Adhesiones
+
+**La adhesion se crea automaticamente o la tengo que crear yo?**
+Ambas opciones. Por defecto, se crea automaticamente tras un pago exitoso a una empresa con `isSchedulable: true`. TAPI puede configurar tu cuenta para deshabilitar adhesiones automaticas, en cuyo caso usar `POST /adhesions/register`.
+
+**Como se si una empresa soporta adhesiones?**
+En el detalle de la empresa, la modalidad tiene el campo `isSchedulable`. Si es `true`, soporta adhesiones. Si es `false`, no ofrecer funcionalidad de agenda.
+
+**Que es el agendaId y como se forma?**
+Formato: `{externalClientId}#{modalityId}#{identifierValue}`. Se genera automaticamente al crear la adhesion.
+
+**Puedo desactivar una adhesion sin eliminarla?**
+Si. Usar `PATCH /adhesions` con `isAdhered: false`. La adhesion permanece pero las notificaciones se detienen. Se puede reactivar con `isAdhered: true`.
+
+**Las adhesiones desactivadas aparecen en GET /adhesions?**
+No por defecto. Solo con el filtro `?allAdhesions=true`.
+
+**Puedo modificar alias y estado en una sola llamada?**
+Si. Enviar tanto `isAdhered` como `alias` en el mismo PATCH. Se actualizan atomicamente.
+
+**El externalClientId debe ser el mismo que uso en POST /debts?**
+Si, es CRITICO. Es el vinculo entre el flujo de pagos y el de agenda. Usar siempre el mismo ID por usuario final.
+
+**Puedo hacer POST /adhesions/register sin que el usuario haya pagado nunca?**
+Si, ese es el proposito del registro manual.
+
+**Hay limite de adhesiones por usuario?**
+No esta documentado un limite. En sandbox se probaron 5+ sin problemas.
+
+### Notificaciones
+
+**Cual es la diferencia entre GET /notifications y includeNotifications=true en GET /adhesions?**
+`GET /notifications` devuelve una lista plana de todas las notificaciones. `GET /adhesions?includeNotifications=true` las agrupa dentro de cada adhesion. Usar /notifications para "Novedades" y /adhesions para "Mis servicios".
+
+**Como uso el notificationId para pagar?**
+El campo `id` de cada notificacion es el `notificationId`. Enviarlos como `ids[]` a `POST /prepare-payment`, que devuelve los `debtId` necesarios para pagar.
+
+**Las notificaciones desaparecen despues de pagar?**
+Si. TAPI envia un webhook `DELETE_NOTIFICATION` con `source: "PAYMENT"` y la notificacion deja de aparecer en `GET /notifications`.
+
+**Que pasa si no pago antes del vencimiento?**
+La notificacion puede recibir un `DELETE_NOTIFICATION` con `source: "EXPIRED"`. La adhesion sigue activa para el proximo periodo.
+
+**Como genero notificaciones en sandbox?**
+Usar `POST /agenda/adhesions/reprocess` en el microservicio Tools con `forceNotification: true`. No existe en produccion.
+
+**Con que frecuencia TAPI genera notificaciones en produccion?**
+Cuando detecta nueva deuda del biller. La frecuencia depende del ciclo de facturacion (mensual, bimestral, etc.). No son periodicas sino por evento.
+
+**Que campos cambian entre tipos de notificacion?**
+- `NEW_BILL`: amount, expirationDate (estimada), lastPaidDate
+- `EXPIRATION`: amount, expirationDate (real, expirationDateWasEstimated: false)
+- `PAY_AGAIN`: lastPaidDate, lastPaidAmount (sin monto de deuda)
+
+**El webhook puede llegar mas de una vez?**
+Si. TAPI reintenta si no recibe HTTP 200. Implementar idempotencia usando el `id` (notificationId) como clave.
+
+**Que respondo al webhook de TAPI?**
+HTTP 200. No se requiere un body especifico. Si no respondes 200, TAPI reintenta.
+
+**Que valores tiene el campo source de DELETE_NOTIFICATION?**
+`"PAYMENT"` (se pago), `"NO_DEBT"` (biller informo que no hay deuda), `"EXPIRED"` (deuda vencio).
+
+### Debito Automatico
+
+**Que es el taskToken y por que es critico?**
+Identificador unico generado por TAPI para cada ciclo de debito. Se recibe en el webhook `debit-incoming` y debe reenviarse exactamente igual en `POST /automatic-debit/confirm`. Sin el, TAPI no puede vincular la confirmacion con el evento.
+
+**Cuanto tiempo es valido el taskToken?**
+No esta documentado el TTL exacto. Procesar y confirmar lo antes posible (minutos, no horas). Si expira, TAPI puede reenviar el webhook con un nuevo token.
+
+**Que pasa si la fintech no puede debitar (fondos insuficientes)?**
+Enviar `POST /automatic-debit/confirm` con `status: "FAILED"`. No enviar `externalPaymentId`. TAPI registra el fallo.
+
+**El usuario puede desactivar el debito automatico?**
+Si. Usar `PATCH /automatic-debit` con `subscribeToAutomaticDebit: false`. Ofrecer esta opcion siempre en la UI.
+
+**Que pasa si desactivo la adhesion pero el debito automatico estaba activo?**
+Al desactivar la adhesion (`isAdhered: false`), se detienen todas las funciones incluyendo debito automatico. No se reciben mas webhooks `debit-incoming` hasta reactivar.
+
+**Puedo activar debito automatico para todas las adhesiones a la vez?**
+No. El endpoint opera sobre una adhesion individual. Para activar en multiples adhesiones, iterar internamente.
+
+**Cual es la diferencia entre debito automatico y la notificacion AGENDA_NOTIFICATION?**
+AGENDA_NOTIFICATION: TAPI notifica deuda, el usuario decide si paga. Debito automatico: TAPI notifica y espera que la fintech debite automaticamente sin intervencion del usuario.
+
+**El comportamiento es diferente en sandbox vs produccion?**
+Si. En sandbox, el webhook `debit-incoming` NO se dispara automaticamente; usar `/reprocess` para simularlo. En produccion, se dispara automaticamente al detectar nueva deuda.
 
 ## Skills Relacionados
 

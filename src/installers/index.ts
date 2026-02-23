@@ -13,7 +13,7 @@ export const DESTINATIONS: Record<string, DestinationConfig> = {
   project: { dir: '.tapi/skills', ext: '.md' },
 };
 
-export const AVAILABLE_SKILLS = ['base', 'auth', 'servicios', 'agenda', 'recargas', 'tapi'];
+export const AVAILABLE_SKILLS = ['base', 'auth', 'companies', 'servicios', 'agenda', 'recargas', 'tapi'];
 
 export interface InstallOptions {
   force?: boolean;

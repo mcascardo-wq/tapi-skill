@@ -23,6 +23,13 @@ Permite a tus usuarios realizar recargas de credito movil, paquetes de datos y o
 4. **Recibir confirmacion** - Webhook `confirmPayment` - TAPI notifica el resultado final (solo si el payment respondio 202)
 5. **Verificar estado** - `GET /operation/{operationId}` - Consultar estado en cualquier momento
 
+## URLs Base
+
+| Ambiente | URL |
+|----------|-----|
+| Sandbox | `https://recharge.homo.tapila.cloud` |
+| Produccion | `https://recharge.tapila.cloud` |
+
 ## Endpoints
 
 ### GET /recharges
@@ -30,7 +37,7 @@ Permite a tus usuarios realizar recargas de credito movil, paquetes de datos y o
 Obtiene el listado completo de empresas de recargas activas. Paginado.
 
 **Headers:**
-- `x-api-key`
+- `x-api-key`: API key del servicio de Recharge
 
 **Query Params (opcionales):**
 - `active`: Filtrar por disponibilidad. Default: `true`. Usar `?active=false` para ver las no disponibles.
@@ -156,6 +163,8 @@ La respuesta tiene la misma estructura que cada elemento de `recharges[]` en `GE
 
 Procesa una recarga.
 
+**Comportamiento sincrono/asincrono**: En recargas, el pago es **sincrono en el ~98% de los casos**. El `POST /payment` responde con HTTP 200 y el status final (`confirmed` o `failed`) directamente. En casos excepcionales puede responder HTTP 202 con status `processing`, y la confirmacion llega via webhook.
+
 **Headers:**
 - `x-authorization-token`
 - `x-api-key`
@@ -225,7 +234,9 @@ Procesa una recarga.
 
 ### Webhook confirmPayment
 
-TAPI envia la confirmacion de la recarga al endpoint del cliente. Solo se dispara cuando el servicio de payment responde con HTTP 202. Puede incluir headers custom para autenticacion.
+TAPI envia la confirmacion de la recarga al endpoint configurado del cliente. Solo se dispara cuando `POST /payment` responde con HTTP 202 (caso asincrono). El webhook se configura informando la URL al equipo de integraciones de TAPI (ver skill **Base**).
+
+El campo `hash` permite validar la autenticidad del webhook si se tiene configurado un metodo de seguridad (API key o encriptacion con public key).
 
 **Payload que TAPI envia:**
 ```json
@@ -265,7 +276,13 @@ TAPI envia la confirmacion de la recarga al endpoint del cliente. Solo se dispar
 
 ### GET /operation/{operationId}
 
-Consulta el estado de una operacion de recarga.
+Consulta el estado de una operacion de recarga. Solo necesario en dos casos:
+1. **Caso excepcional de HTTP 202**: Cuando `POST /payment` respondio 202 (biller lento) y se necesita confirmar el resultado
+2. **Reconciliacion**: Para verificar estados historicos
+
+En el ~98% de los casos de recargas, `POST /payment` responde 200 con el estado final y no es necesario usar este endpoint.
+
+**Importante**: Este endpoint existe en el microservicio de **Recharges** (`recharge.homo.tapila.cloud`). Un `operationId` de recargas no se encontrara si se consulta en el microservicio de servicios, y viceversa.
 
 **Headers:**
 - `x-authorization-token`
@@ -301,14 +318,19 @@ Consulta el estado de una operacion de recarga.
 | Campo | Tipo | Descripcion |
 |-------|------|-------------|
 | operationId | String | ID de la operacion |
-| status | String | `pending`, `confirmed` o `failed` |
+| status | String | `processing`, `confirmed` o `failed` |
 | externalPaymentId | String | ID del pago del cliente |
 | externalClientId | String | Identificador del usuario final |
-| additionalData | Object | Datos adicionales sobre la imputacion |
+| additionalData | Object | Datos adicionales (agent, customerId, ticket, providerName) |
 | companyCode | String | Codigo de compania |
 | companyName | String | Nombre de la compania |
 | amount | Number | Monto de la recarga |
-| createdAt | String | Fecha y hora UTC del procesamiento |
+| createdAt | String | Fecha y hora UTC (ISO 8601) |
+
+**Busqueda por externalPaymentId:**
+```
+GET /operation/{externalPaymentId}?type=external-payment-id
+```
 
 ## Tools
 
@@ -349,19 +371,134 @@ Consulta el balance del dinero prefondeado del cliente con TAPI. Control en tiem
 - `x-authorization-token`
 - `x-api-key`
 
+## amountType por Pais
+
+El comportamiento del `amountType` varia segun el pais:
+
+| Pais | Comportamiento |
+|------|----------------|
+| Mexico | Predominantemente paquetes `CLOSED` (montos fijos) |
+| Argentina, Colombia, Peru, Chile | Mix de `OPEN` (monto variable) y `CLOSED` (monto fijo) |
+
+Tener en cuenta esta diferencia al disenar la pantalla de seleccion de monto.
+
+## Errores de POST /payment
+
+| HTTP | Codigo | Mensaje | Causa | Solucion |
+|------|--------|---------|-------|----------|
+| 400 | RPA04022 | Monto invalido | El monto no cumple el formato esperado | Verificar que sea un numero valido con hasta 2 decimales |
+| 400 | XPA04023 | Falta productId | No se incluyo `productId` en el body | Agregar el `productId` del catalogo |
+| 400 | RPA04041 | Monto fuera de rango | El monto esta por debajo de `minAmount` o por encima de `maxAmount` | Validar rango segun el producto antes de enviar |
+| 404 | XCX04325 | Company not found | El `companyCode` no existe o esta inactivo | Verificar contra el catalogo actualizado |
+| 404 | RPA04345 | Producto no encontrado | El `productId` no existe para esa company | Verificar `productId` en el catalogo |
+| 409 | XPA04626 | externalPaymentId duplicado | Ya existe un pago con ese `externalPaymentId` | No reintentar; verificar estado con `GET /operation` |
+| 429 | RPA04680 | Limite de recargas alcanzado | Se excedio el limite de recargas para ese numero | Informar al usuario; esperar antes de reintentar |
+| 500 | XX05000 | Error del proveedor | El operador respondio con error | Reintentar mas tarde |
+| 500 | XPA05170 | Error interno | Error interno de TAPI | Reintentar mas tarde |
+
+## Idempotencia
+
+Si se envia un `POST /payment` con un `externalPaymentId` ya utilizado, TAPI rechazara la solicitud (XPA04626) indicando que ese ID ya fue procesado. Esto protege contra cobros duplicados.
+
+**No reintentar pagos fallidos.** TAPI tiene logica de reintentos interna que optimiza el flujo con los operadores.
+
+## Flujo Detallado de Recarga
+
+```
+1. POST /login → Obtener accessToken
+   ↓
+2. GET /recharges (Companies) → Catalogo de empresas y productos
+   ↓
+3. Usuario selecciona empresa (operador)
+   ↓
+4. Mostrar productos disponibles (paquetes/montos)
+   ↓
+5. Usuario selecciona producto y monto (segun amountType)
+   ↓
+6. Usuario ingresa identificador (numero de telefono)
+   ↓
+7. Validar input (minLength, maxLength, dataType)
+   ↓
+8. POST /payment → Ejecutar recarga
+   ↓
+9a. HTTP 200 → Recarga confirmada. Mostrar resultado inmediato al usuario
+   ↓ (caso excepcional ~2%)
+9b. HTTP 202 → Biller lento. Status: processing
+   ↓
+10. Esperar webhook confirmPayment o polling con GET /operation
+```
+
+### Flujo ante timeout de POST /payment
+
+```
+1. POST /payment da timeout
+   ↓  NUNCA reintentar con nuevo externalPaymentId (podria duplicar la recarga)
+   ↓
+2. Si se recibio operationId → GET /operation/{operationId}
+   Si no se recibio response → Reintentar con el MISMO externalPaymentId
+   ↓
+3. TAPI rechaza duplicado si ya se proceso (XPA04626), o procesa si no
+```
+
 ## Buenas Practicas
 
-- Cachear el catalogo de empresas, no consultarlo en cada request
+- Cachear el catalogo de empresas y refrescar cada ~1 hora, no consultarlo en cada request
 - Validar longitud del identificador (`minLength`/`maxLength`) antes de enviar el pago
 - Mostrar el `helpText` al usuario para que sepa que dato ingresar
 - Respetar el `amountType`: si es `OPEN` validar rango, si es `CLOSED` usar monto fijo, si es `FIXED` solo permitir valores de `allowedAmounts`
 - Guardar `operationId` y `externalPaymentId` para soporte y trazabilidad
-- Implementar el webhook de confirmacion para recibir el estado final
+- Implementar el webhook de confirmacion para el caso excepcional de HTTP 202
 - Verificar estado con `GET /operation/{operationId}` si no llega el webhook
 - Consultar `/exchange/rate` si se necesitan montos en USD
 - Consultar `/wallet/balance` para verificar saldo antes de operar
+- Deshabilitar boton de recarga tras primer clic para prevenir duplicados
+
+## Preguntas Frecuentes (FAQs)
+
+**Cual es la diferencia principal entre el flujo de recargas y el de servicios?**
+Recargas es transaccional directo (seleccionar producto, pagar). No hay paso de consulta de deuda (`POST /debts`). El flujo tiene 4 pasos (Login, Catalogo, Payment, GetOp) vs 6 en servicios.
+
+**Necesito consultar deuda antes de hacer una recarga?**
+No. Las recargas no tienen concepto de "deuda". El usuario selecciona un producto del catalogo (que ya incluye monto y caracteristicas) y se ejecuta directamente.
+
+**Como se que una recarga fue exitosa?**
+Si recibes HTTP 200, la recarga fue exitosa. No necesitas polling ni webhook. Solo en el caso excepcional de HTTP 202 la confirmacion se vuelve asincrona.
+
+**Que pasa si el request da timeout?**
+No asumir que fallo. No reintentar con nuevo `externalPaymentId` (podria duplicar). Si se recibio `operationId`, consultar `GET /operation`. Si no se recibio response, reintentar con el **mismo** `externalPaymentId`.
+
+**El token es el mismo que uso para servicios?**
+Si. El `accessToken` de `POST /login` sirve para ambos microservicios. Lo que cambia es la `x-api-key` (cada microservicio tiene la suya).
+
+**Puedo recargar cualquier numero de telefono?**
+El endpoint no valida si el numero pertenece al operador seleccionado. Implementar validacion del lado del integrador si es posible, aunque con la portabilidad numerica no siempre se puede determinar el operador actual.
+
+**Puedo hacer multiples recargas al mismo numero?**
+Si, pero cada una debe tener un `externalPaymentId` unico. Los operadores pueden imponer limites de recargas por numero (error RPA04680) que varian por operador, monto y periodo.
+
+**Puedo revertir o cancelar una recarga ya procesada?**
+No. TAPI no soporta reversiones ni cancelaciones de recargas. Si ocurre un problema post-pago, contactar al equipo de operaciones de TAPI.
+
+**El paymentMethod afecta el procesamiento?**
+No. Es puramente informativo. TAPI no cobra al usuario final; eso es responsabilidad del integrador. Enviar el valor correcto para reporteria y conciliacion.
+
+**Que es la empresa de homologacion MX-R-90006?**
+Es una empresa de prueba de TAPI con un solo producto (Recarga $200 CLOSED) y comportamiento predecible. Usar para pruebas iniciales de integracion y CI/CD automatizados.
+
+**Como manejo el campo additionalData del producto?**
+En la mayoria de productos es null. Si contiene campos, incluirlos en el request. `packageInformation` puede incluir datos de internet, minutos y SMS del paquete.
+
+**Cual es el formato correcto del numero de telefono para Mexico?**
+10 digitos sin prefijo (ej: `5525752111`). No usar prefijo +52 ni 52.
+
+**El endpoint es idempotente?**
+Si, gracias al `externalPaymentId`. UUID nuevo = operacion nueva. UUID repetido = rechazo (XPA04626). Esto protege contra cobros dobles.
+
+**Que pasa si consulto un operationId de recargas en el microservicio de servicios?**
+Recibiras HTTP 400. Los microservicios son independientes. Almacenar el tipo de operacion junto con el `operationId` para dirigir las consultas al microservicio correcto.
 
 ## Skills Relacionados
 
 - [[base]] - Contexto general de TAPI
 - [[auth]] - Autenticacion requerida (POST /login, headers x-authorization-token y x-api-key)
+- [[companies]] - Catalogo de empresas, productos y queryData

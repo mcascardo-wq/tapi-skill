@@ -33,6 +33,7 @@ npx @tapi.la/skills update
 |-------|-------------|
 | `base` | Contexto general de TAPI, estructura de API, errores |
 | `auth` | Autenticación JWT, login, refresh de tokens |
+| `companies` | Catálogo de empresas, estructura jerárquica, recomendaciones UX |
 | `servicios` | Pago de facturas y servicios públicos |
 | `agenda` | Gestión de adhesiones y notificaciones |
 | `recargas` | Recargas móviles y de datos |

@@ -20,6 +20,13 @@ Permite a tus usuarios pagar facturas de servicios publicos (luz, agua, gas, int
 4. **Recibir confirmacion** - Webhook confirmPayment - TAPI notifica el resultado final
 5. **Verificar estado** - GET /operation/{operationId} - Consultar estado en cualquier momento
 
+## URLs Base
+
+| Ambiente | URL |
+|----------|-----|
+| Sandbox | `https://services.homo.tapila.cloud` |
+| Produccion | `https://services.tapila.cloud` |
+
 ## Endpoints
 
 ### GET /services
@@ -28,7 +35,7 @@ Obtiene el listado de empresas de servicios activas. Paginado (5000 por pagina p
 
 **Headers:**
 - `x-authorization-token`: Token JWT obtenido del login
-- `x-api-key`: API key provista por TAPI
+- `x-api-key`: API key del servicio de Services
 
 **Query Params (opcionales):**
 - `active`: Flag para empresas activas (default: true)
@@ -187,9 +194,9 @@ Consulta las facturas pendientes de pago para una empresa.
 
 **Campos importantes de debts[]:**
 - `debtId`: ID para usar en el pago
-- `amount`: Monto de la factura
+- `amount`: Monto de la factura. **Para `amountType: "OPEN"`, el `amount` es 0** porque el biller no informa un monto fijo; el usuario elige cuanto pagar dentro del rango `[minAmount, maxAmount]`
 - `minAmount` / `maxAmount`: Rango permitido de pago
-- `amountType`: "OPEN" (monto abierto) o "CLOSED" (monto fijo)
+- `amountType`: "OPEN" (monto abierto, el usuario elige el monto) o "CLOSED" (monto fijo, no editable)
 - `expired`: true si la factura ya no se puede pagar
 
 ---
@@ -249,11 +256,15 @@ Procesa el pago de una deuda.
 - `confirmed`: Pago confirmado exitosamente
 - `failed`: Pago fallido
 
+**Importante**: En servicios, `POST /payment` **siempre responde con HTTP 202** y status `processing`. El resultado final llega por webhook o se consulta con `GET /operation/{operationId}`.
+
 ---
 
 ### Webhook confirmPayment
 
-TAPI envia la confirmacion del pago a un endpoint del cliente.
+TAPI envia la confirmacion del pago al endpoint configurado del cliente. El webhook se configura informando la URL al equipo de integraciones de TAPI (ver skill **Base** para detalle).
+
+El campo `hash` permite validar la autenticidad del webhook si se tiene configurado un metodo de seguridad (API key o encriptacion con public key). Si no se configuro seguridad, el campo puede ignorarse.
 
 **Request que TAPI envia:**
 ```json
@@ -286,13 +297,19 @@ TAPI envia la confirmacion del pago a un endpoint del cliente.
 
 ### GET /operation/{operationId}
 
-Consulta el estado de una operacion.
+Consulta el estado de una operacion de pago. Cumple tres funciones criticas:
+
+1. **Confirmacion de pagos**: Verificar que un pago alcanzo `confirmed` y obtener el comprobante (ticket)
+2. **Respaldo al webhook**: Cuando el webhook no llega, permite verificar el estado via polling
+3. **Reconciliacion**: Consultar operaciones historicas para conciliacion diaria
+
+**Importante**: Este endpoint existe en el microservicio de **Services** (`services.homo.tapila.cloud`). Un `operationId` de servicios no se encontrara si se consulta en el microservicio de recargas, y viceversa.
 
 **Headers:**
 - `x-authorization-token`
 - `x-api-key`
 
-**Response:**
+**Response 200 OK:**
 ```json
 {
   "operationId": "f7872991-be03-49ae-ba0e-567d0dffd6ac",
@@ -303,14 +320,69 @@ Consulta el estado de una operacion.
   "companyName": "EDENOR",
   "amount": 100,
   "createdAt": "2022-06-30T20:58:29.304Z",
-  "additionalData": {...}
+  "additionalData": {
+    "agent": "Agente Oficial TAPI",
+    "customerId": "uuid-del-cliente",
+    "ticket": [
+      "================================",
+      "COMPROBANTE DE PAGO",
+      "Empresa: EDENOR",
+      "Monto: $100.00",
+      "================================"
+    ],
+    "providerName": "TAPI"
+  }
 }
 ```
+
+| Campo | Tipo | Descripcion |
+|-------|------|-------------|
+| operationId | String | ID unico de la operacion |
+| status | String | `processing`, `confirmed` o `failed` |
+| externalPaymentId | String | ID del pago asignado por el cliente |
+| externalClientId | String | Identificador del usuario final |
+| companyCode | String | Codigo de la empresa |
+| companyName | String | Nombre de la empresa |
+| amount | Number | Monto del pago |
+| createdAt | String | Fecha y hora UTC (ISO 8601) |
+| additionalData.ticket | String[] | Comprobante de pago linea por linea (renderizar con fuente monoespaciada) |
+| additionalData.agent | String | Nombre del agente procesador |
+
+**Estados posibles:**
+
+| Status | Significado | Es final? |
+|--------|-------------|-----------|
+| `processing` | Pago en proceso, esperando confirmacion del biller | No |
+| `confirmed` | Pago exitoso, acreditado | Si |
+| `failed` | Pago rechazado o fallido | Si |
 
 **Busqueda por externalPaymentId:**
 ```
 GET /operation/{externalPaymentId}?type=external-payment-id
 ```
+
+Usar exactamente `external-payment-id` (minusculas con guiones).
+
+**Cuando usar cada identificador:**
+
+| Situacion | Usar |
+|-----------|------|
+| Tienes el operationId almacenado | `GET /operation/{operationId}` |
+| Solo tienes tu propio ID de pago | `GET /operation/{externalPaymentId}?type=external-payment-id` |
+| Reconciliacion desde tu BD | `externalPaymentId` (tu BD indexa por tu propio ID) |
+| Soporte con TAPI | `operationId` (TAPI trabaja internamente con este ID) |
+
+**Estrategia de polling (respaldo al webhook):**
+
+Si el webhook no llega despues de `POST /payment`, iniciar polling con backoff exponencial (ver seccion de Polling en skill **Base**): 30s, 30s, 60s, 120s, 180s, 300s. Timeout final: 30 minutos.
+
+**Cacheabilidad:**
+
+| Estado | Cacheable? |
+|--------|-----------|
+| `processing` | No (puede cambiar en cualquier momento) |
+| `confirmed` | Si (estado final, inmutable) |
+| `failed` | Si (estado final, inmutable) |
 
 ## Tipos de Modalidad
 
@@ -318,7 +390,8 @@ GET /operation/{externalPaymentId}?type=external-payment-id
 |--------------|-------------|
 | input | Ingreso manual (numero de cliente, etc.) |
 | barcode | Codigo de barras de la factura |
-| qr | Codigo QR |
+| qr | Codigo QR (disponible solo en Argentina en produccion) |
+| image | Imagen de la factura |
 
 ## Tipos de Datos (dataType)
 
@@ -330,33 +403,191 @@ GET /operation/{externalPaymentId}?type=external-payment-id
 | IMP | Importe |
 | CBA | Codigo de barras |
 
+## Lifecycle del debtId
+
+Cada llamada a `POST /debts` genera un `debtId` nuevo, incluso para la misma deuda:
+
+1. Cada `debtId` tiene un tiempo de vida limitado
+2. Los `debtId` de consultas anteriores **expiran y no son reutilizables**
+3. Para pagar, siempre obtener un `debtId` fresco con `POST /debts` inmediatamente antes del pago
+4. El formato del `debtId` es `{operationId}-{N}` donde N es el indice de la deuda (empezando en 0)
+
+## externalRequestId
+
+El campo `externalRequestId` es **obligatorio** en `POST /debts`. Debe ser un UUID v4 unico por cada consulta de deuda. Sirve para:
+- Trazabilidad de consultas en los logs de TAPI
+- Correlacion entre la consulta del cliente y la respuesta de TAPI
+
+## Comportamiento en Sandbox
+
+En el ambiente de Sandbox, los pagos de servicios se **confirman inmediatamente** (el status pasa a `confirmed` sin delay). El webhook `confirmPayment` puede no llegar en sandbox. En produccion, el flujo siempre es asincrono (HTTP 202 → esperar webhook o polling).
+
 ## Casos Edge
 
 - **Sin deuda**: La consulta puede retornar `debts: []` si no hay deuda pendiente
 - **Factura vencida**: `expired: true` indica que ya no se puede pagar
-- **Pago parcial**: Solo si `amountType: "OPEN"` y `minAmount < amount`
+- **Pago parcial**: Solo si `amountType: "OPEN"` y `minAmount < amount`. Si el usuario paga parcialmente, la deuda se actualiza en el biller. La proxima consulta a `POST /debts` reflejara el saldo actualizado
+- **Pago por otro canal**: Si el usuario pago la deuda por otro canal (banco, cajero, etc.) y ese canal actualizo la deuda en el biller, al consultar `POST /debts` en TAPI se reflejara el estado actualizado. Si la deuda fue pagada en su totalidad, la consulta retornara `debts: []` o el error `SDE04342` (no se encontro deuda)
+- **Monto abierto (OPEN) con amount=0**: Comportamiento esperado. Las deudas con `amountType: "OPEN"` devuelven `amount: 0` porque el biller no informa un monto fijo. El usuario elige cuanto pagar dentro del rango `[minAmount, maxAmount]`. No mostrar `$0` al usuario
 - **Timeout**: Siempre verificar estado final con GET /operation despues de pagar
 - **Codigo invalido**: Validar formato segun `minLength`/`maxLength` antes de consultar
+- **debtId expirado**: Si el pago falla con SPA04345, obtener un debtId fresco con POST /debts
 
-## Errores Comunes
+## Errores
 
-| Error | Codigo | Causa | Solucion |
-|-------|--------|-------|----------|
-| 404 | SDE04342 | No hay deuda pendiente | Informar al usuario |
-| 400 | - | Parametros invalidos | Verificar formato segun modalidad |
-| 500 | XCX05060 | Error interno | Reintentar mas tarde |
+### Errores de POST /debts (Consulta de deuda)
+
+| HTTP | Codigo | Mensaje | Causa | Solucion |
+|------|--------|---------|-------|----------|
+| 400 | SDE04022 | Campo obligatorio faltante | Falta un campo requerido en el body | Verificar que todos los campos esten presentes |
+| 404 | SDE04342 | No se encontro deuda | No hay deuda pendiente para ese identificador | Informar al usuario que no tiene deuda |
+| 400 | SDE04343 | Identificador invalido | El valor del identificador no es valido para la empresa | Verificar formato segun `minLength`/`maxLength` y `dataType` de la modalidad |
+| 500 | SDE05070 | Error del proveedor | El biller respondio con error | Reintentar mas tarde, el proveedor puede estar caido |
+| 409 | SDE44389 | Deuda ya pagada | La deuda consultada ya fue abonada | Informar al usuario |
+| 410 | SDE04646 | Deuda vencida | La deuda ya expiro | Informar al usuario que la deuda esta vencida |
+| 500 | XCX05060 | Error interno | Error interno de TAPI | Reintentar mas tarde |
+
+### Errores de POST /payment (Pago)
+
+| HTTP | Codigo | Mensaje | Causa | Solucion |
+|------|--------|---------|-------|----------|
+| 400 | SPA04023 | Falta externalPaymentId | No se incluyo el campo `externalPaymentId` | Agregar un UUID v4 unico como `externalPaymentId` |
+| 400 | SPA04041 | Monto fuera de rango | El monto esta por debajo de `minAmount` o por encima de `maxAmount` | Validar rango antes de enviar |
+| 404 | SPA04345 | debtId no encontrado o expirado | El `debtId` no existe o ya expiro | Obtener un `debtId` fresco con `POST /debts` |
+| 409 | SPA04649 | Pago duplicado | Ya existe un pago con ese `externalPaymentId` | No reintentar; verificar estado con `GET /operation` |
+| 500 | SPR05091 | Error del proveedor | Error al procesar con el biller | Verificar con `GET /operation` antes de reintentar |
+
+## isSchedulable y Agenda
+
+El campo `isSchedulable` en cada modalidad indica si soporta adhesiones en la agenda:
+- **`true`**: Se pueden guardar adhesiones y generar notificaciones de nuevos vencimientos
+- **`false`**: No soporta agenda (el identificador cambia cada periodo o el biller no devuelve saldo)
+
+Solo las modalidades con `isSchedulable: true` deben ofrecerse para adherirse a recordatorios. Ver skill de **Agenda** para mas detalle.
+
+## Idempotencia
+
+Si se envia un `POST /payment` con un `externalPaymentId` ya utilizado, TAPI rechazara la solicitud indicando que ese ID ya fue procesado. Esto protege contra cobros duplicados.
+
+**No reintentar pagos fallidos.** TAPI tiene logica de reintentos interna que optimiza el flujo con los billers.
+
+## Flujo Detallado de Pago de Servicios
+
+```
+1. POST /login → Obtener accessToken
+   ↓
+2. GET /services (Companies) → Catalogo de empresas
+   ↓
+3. Usuario selecciona empresa y modalidad
+   ↓
+4. Usuario ingresa identificador (numero de cliente, barcode, etc.)
+   ↓
+5. Validar input (minLength, maxLength, dataType)
+   ↓
+6. POST /debts → Consultar deuda pendiente
+   ↓  Genera debtId fresco (efimero, usar inmediatamente)
+   ↓
+7. Mostrar deuda(s) al usuario (monto, vencimiento, amountType)
+   ↓  Verificar expired=false antes de permitir pago
+   ↓
+8. Usuario confirma pago → POST /payment (siempre responde 202 + status: processing)
+   ↓
+9. Mostrar pantalla "procesando" (15 segundos)
+   ↓
+10a. Webhook confirmPayment llega → Mostrar resultado final (confirmed/failed)
+   ↓ (si no llega en 15s)
+10b. Mostrar pantalla "pago en proceso" (naranja/intermedia)
+   ↓
+11. Confirmar al usuario via push notification o email cuando se resuelva
+   ↓ (respaldo)
+12. GET /operation/{operationId} con polling backoff si webhook nunca llega
+```
+
+### Flujo ante timeout de POST /payment
+
+```
+1. POST /payment da timeout (no llega response)
+   ↓  NUNCA reintentar automaticamente
+   ↓
+2. GET /operation/{externalPaymentId}?type=external-payment-id
+   ↓
+3a. Si retorna datos → El pago llego a TAPI. Verificar status
+3b. Si retorna 404 → El pago NUNCA llego. Seguro reintentar con nuevo POST /payment
+3c. Si el GET tambien falla → Esperar y reintentar el GET con backoff
+```
 
 ## Buenas Practicas
 
-- Cachear el catalogo de empresas, no consultarlo en cada request
+- Cachear el catalogo de empresas y refrescar cada ~1 hora, no consultarlo en cada request
 - Siempre mostrar el `helpText` de la modalidad al usuario
 - Validar longitud del identificador antes de enviar a /debts
 - Guardar `operationId` y `externalPaymentId` para soporte
 - Implementar el webhook de confirmacion para estado final
 - Verificar `expired` antes de mostrar una deuda como pagable
+- Mostrar pantalla de procesando por 15 segundos esperando webhook; si no llega, informar "pago en proceso" y confirmar luego via push/email
+- NUNCA cachear respuestas de POST /debts (las deudas son dinamicas, los debtId son efimeros)
+- Deshabilitar boton de pago tras primer clic para prevenir pagos duplicados
+- Almacenar siempre tanto `operationId` como `externalPaymentId`
+
+## Preguntas Frecuentes (FAQs)
+
+**Por que la consulta de deudas es POST y no GET?**
+Porque el request contiene datos sensibles del usuario (`identifierValue`). Usar POST evita que queden en logs de servidores, historial del navegador o headers de referencia.
+
+**Puede una empresa retornar multiples deudas?**
+Si. Un cliente puede tener multiples facturas pendientes. Cada deuda tiene su propio `debtId`. La UI debe soportar un numero arbitrario de deudas.
+
+**Cual es la diferencia entre amountType CLOSED y OPEN?**
+CLOSED: monto fijo (`minAmount == maxAmount`), mostrar sin campo editable. OPEN: monto abierto, el `amount` devuelto es **0** porque el biller no informa un monto fijo. El usuario elige cuanto pagar dentro del rango `[minAmount, maxAmount]`. Mostrar campo editable con el rango permitido. Nunca mostrar `$0` al usuario como si fuera el monto adeudado; en su lugar, indicar que el monto es a eleccion del usuario.
+
+**Que hago con las deudas expiradas (expired=true)?**
+No permitir el pago. Mostrar como informativa con indicador visual de "vencida". Deshabilitar el boton de pago.
+
+**El debtId tiene tiempo de expiracion?**
+Si. Tratar el `debtId` como efimero. Obtener uno fresco de `POST /debts` justo antes de pagar. No almacenar `debtId` para uso diferido.
+
+**Es seguro reintentar la consulta de deudas?**
+Si. `POST /debts` es una operacion de solo lectura sin side effects. Seguro reintentar ante timeouts o errores 5xx.
+
+**Debo cachear las deudas?**
+NUNCA. Las deudas son dinamicas: pueden cambiar por pagos parciales o pagos desde otros canales. Cuando otro canal actualiza la deuda en el biller, TAPI refleja ese cambio en la proxxima consulta a `POST /debts`. Los `debtId` se regeneran con cada consulta.
+
+**Si el usuario paga por otro canal, TAPI se entera?**
+TAPI no recibe notificaciones directas de pagos en otros canales. Pero la consulta de deuda (`POST /debts`) se realiza en tiempo real contra el biller. Si el biller ya actualizo la deuda (por pago parcial o total desde otro canal), la respuesta de TAPI reflejara el estado actual. Si la deuda fue pagada en su totalidad, la consulta retornara sin deudas pendientes.
+
+**El externalPaymentId garantiza idempotencia?**
+TAPI rechaza un segundo pago con el mismo `externalPaymentId` (error SPA04649). Implementar tambien idempotencia del lado propio: verificar en BD si ya existe un pago con ese ID antes de enviar.
+
+**Cual es la diferencia de comportamiento entre sandbox y produccion?**
+En sandbox, los pagos se confirman inmediatamente (status `confirmed` sincrono, no llega webhook). En produccion, siempre es asincrono (`processing`, esperar webhook o polling).
+
+**Que hago si POST /payment da timeout?**
+NUNCA reintentar automaticamente. Consultar `GET /operation/{externalPaymentId}?type=external-payment-id`. Si 404, seguro reintentar. Si existe, verificar status.
+
+**Como manejar el status "processing"?**
+Registrar `operationId` y `externalPaymentId` con estado "pendiente". Mostrar "pago en proceso" al usuario. Esperar webhook (primario) o polling (respaldo). Actualizar cuando llegue confirmacion.
+
+**Que es el campo additionalData.ticket?**
+Es un array de strings que representa el comprobante de pago del proveedor, linea por linea. Renderizar con fuente monoespaciada. Ofrecer opcion de compartir o descargar.
+
+**Puedo revertir o cancelar un pago ya procesado?**
+No. TAPI no soporta reversiones ni cancelaciones de pagos. Si ocurre un problema post-pago, contactar al equipo de operaciones de TAPI.
+
+**El paymentMethod afecta el procesamiento?**
+No. Es puramente informativo. TAPI no diferencia entre `DEBIT`, `ACCOUNT` o `CREDIT`. Enviar el valor correcto para reporteria y conciliacion.
+
+**Que son los exchangeDetails en la respuesta de debts?**
+Equivalencia del monto en otras monedas (referencia). El pago siempre se realiza en la moneda principal de la deuda.
+
+**Que son las expirations en la respuesta de debts?**
+Calendario de montos futuros. Indica que el monto cambiara despues de cierta fecha (ej: recargos moratorios). Mostrar aviso al usuario.
+
+**Puedo hacer pagos concurrentes para diferentes deudas?**
+Si, siempre que cada pago tenga un `debtId` diferente y un `externalPaymentId` unico. No enviar pagos concurrentes para la misma deuda.
 
 ## Skills Relacionados
 
 - [[base]] - Contexto general de TAPI
 - [[auth]] - Autenticacion requerida
+- [[companies]] - Catalogo de empresas, modalidades y queryData
 - [[agenda]] - Adhesiones para consultas recurrentes
